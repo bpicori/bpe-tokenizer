@@ -1,8 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
+
+	"github.com/dlclark/regexp2"
 )
 
 type Pair struct {
@@ -20,6 +21,48 @@ type Merge struct {
 }
 
 const VOCAB_SIZE = 279
+const GPT4_SPLIT_PATTERN = `(?i:'[sdmt]|'ll|'ve|'re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+`
+
+
+type BPETokenizer struct {
+	vocab     map[string]int
+	idToToken map[int]string
+	vocabSize int
+	merges    []Merge
+}
+
+func NewBPETokenizer() *BPETokenizer {
+	return &BPETokenizer{
+		vocab:     make(map[string]int),
+		idToToken: make(map[int]string),
+		vocabSize: 0,
+		merges:    []Merge{},
+	}
+}
+
+func (bpe *BPETokenizer) Tokenize(text string) []int {
+	re := regexp2.MustCompile(GPT4_SPLIT_PATTERN, regexp2.None)
+	tokens := []int{}
+	start := 0
+
+	for start < len(text) {
+		match, err := re.FindStringMatch(text[start:])
+		if err != nil || match == nil {
+			break
+		}
+
+		matched := match.String()
+		if _, exists := bpe.vocab[matched]; !exists {
+			bpe.vocab[matched] = bpe.vocabSize
+			bpe.idToToken[bpe.vocabSize] = matched
+			bpe.vocabSize++
+		}
+		tokens = append(tokens, bpe.vocab[matched])
+		start += match.Index + len(matched)
+	}
+
+	return tokens
+}
 
 func merge(list []int, pair Pair, index int) []int {
 	newList := []int{}
@@ -63,65 +106,53 @@ func mostFrequentPair(m map[Pair]int) Pair {
 	return maxPair
 }
 
-func decode(tokens []int, merges []Merge) string {
-	vocab := make(map[int][]byte)
-	for i := 0; i < 256; i++ {
-		vocab[i] = []byte{byte(i)}
+func (bpe *BPETokenizer) Decode(tokens []int) string {
+	localVocab := make(map[int]string)
+
+	for id, tok := range bpe.idToToken {
+		localVocab[id] = tok
 	}
 
-	for _, merge := range merges {
-		vocab[merge.Index] = append(vocab[merge.Pair.First], vocab[merge.Pair.Second]...)
+	for _, merge := range bpe.merges {
+		first := localVocab[merge.Pair.First]
+		second := localVocab[merge.Pair.Second]
+		localVocab[merge.Index] = first + second
 	}
 
-	var buffer bytes.Buffer
+	var result string
 	for _, token := range tokens {
-		buffer.Write(vocab[token])
+		result += localVocab[token]
 	}
-	byteSequence := buffer.Bytes()
-
-	// Decode to UTF-8
-	text := string(bytes.Runes(byteSequence))
-
-	return text
+	return result
 }
 
-func encode(text string, merges []Merge) []int {
-	tokens := make([]int, len(text))
-	for i, b := range []byte(text) {
-		tokens[i] = int(b)
-	}
+func (bpe *BPETokenizer) Encode(text string) []int {
+	tokens := bpe.Tokenize(text)
 
-	for _, m := range merges {
+	for _, m := range bpe.merges {
 		tokens = merge(tokens, m.Pair, m.Index)
 	}
 
 	return tokens
 }
 
-func buildVocab(text string) ([]int, []Merge) {
-	tokens := make([]int, len(text))
-	for i, b := range []byte(text) {
-		tokens[i] = int(b)
-	}
-
+func (bpe *BPETokenizer) BuildVocab(text string) {
+	tokens := bpe.Tokenize(text)
 	numOfMerges := VOCAB_SIZE - 256
-
-	merges := []Merge{}
 	for i := 0; i < numOfMerges; i++ {
-		stats := stats(tokens)
-		maxUsedPair := mostFrequentPair(stats)
+		statsMap := stats(tokens)
+		maxUsedPair := mostFrequentPair(statsMap)
 		idx := 256 + i
 		tokens = merge(tokens, maxUsedPair, idx)
-		merges = append(merges, Merge{maxUsedPair, idx})
+		bpe.merges = append(bpe.merges, Merge{maxUsedPair, idx})
 	}
-
-	return tokens, merges
 }
 
 func main() {
 	trainingText := `Byte-pair encoding[1][2] (also known as BPE, or digram coding)[3] is an algorithm, first described in 1994 by Philip Gage, for encoding strings of text into smaller strings by creating and using a translation table.[4] A slightly modified version of the algorithm is used in large language model tokenizers.The original version of the algorithm focused on compression. It replaces the highest-frequency pair of bytes with a new byte that was not contained in the initial dataset. A lookup table of the replacements is required to rebuild the initial dataset. The modified version builds "tokens" (units of recognition) that match varying amounts of source text, from single characters (including single digits or single punctuation marks) to whole words (even long compound words).[5][6][7]`
 
-	_, merges := buildVocab(trainingText)
+	bpe := NewBPETokenizer()
+	bpe.BuildVocab(trainingText)
 
-	fmt.Println(decode(encode("hello world", merges), merges))
+	fmt.Println(bpe.Decode(bpe.Encode("hello world")))
 }
