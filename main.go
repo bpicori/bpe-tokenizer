@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"bytes"
+	"fmt"
+)
 
 type Pair struct {
 	First  int
@@ -16,17 +19,17 @@ type Merge struct {
 	Index int
 }
 
+const VOCAB_SIZE = 279
+
 func merge(list []int, pair Pair, index int) []int {
 	newList := []int{}
 
-	for i := 0; i < len(list)-1; i++ {
-		first := list[i]
-		second := list[i+1]
-		if first == pair.First && second == pair.Second {
+	for i := 0; i < len(list); i++ {
+		if i < len(list)-1 && list[i] == pair.First && list[i+1] == pair.Second {
 			newList = append(newList, index)
-			i++
+			i++ // skip the next element as we merged
 		} else {
-			newList = append(newList, first)
+			newList = append(newList, list[i])
 		}
 	}
 
@@ -36,7 +39,7 @@ func merge(list []int, pair Pair, index int) []int {
 func stats(tokens []int) map[Pair]int {
 	m := make(map[Pair]int)
 
-	for i := 0; i < len(tokens)-1; i++ {
+	for i := range len(tokens) - 1 {
 		curr := tokens[i]
 		next := tokens[i+1]
 		pair := Pair{curr, next}
@@ -46,7 +49,7 @@ func stats(tokens []int) map[Pair]int {
 	return m
 }
 
-func max(m map[Pair]int) Pair {
+func mostFrequentPair(m map[Pair]int) Pair {
 	max := 0
 	maxPair := Pair{}
 
@@ -61,53 +64,64 @@ func max(m map[Pair]int) Pair {
 }
 
 func decode(tokens []int, merges []Merge) string {
-	vocab := make(map[int]string)
+	vocab := make(map[int][]byte)
 	for i := 0; i < 256; i++ {
-		vocab[i] = string(rune(i))
+		vocab[i] = []byte{byte(i)}
 	}
+
 	for _, merge := range merges {
-		vocab[merge.Index] = fmt.Sprintf("%s%s", vocab[merge.Pair.First], vocab[merge.Pair.Second])
+		vocab[merge.Index] = append(vocab[merge.Pair.First], vocab[merge.Pair.Second]...)
 	}
 
-	decoded := ""
+	var buffer bytes.Buffer
 	for _, token := range tokens {
-		decoded = decoded + vocab[token]
+		buffer.Write(vocab[token])
 	}
+	byteSequence := buffer.Bytes()
 
-	return decoded
+	// Decode to UTF-8
+	text := string(bytes.Runes(byteSequence))
+
+	return text
 }
 
-func main() {
-	text := `Byte-pair encoding[1][2] (also known as BPE, or digram coding)[3] is an algorithm, first described in 1994 by Philip Gage, for encoding strings of text into smaller strings by creating and using a translation table.[4] A slightly modified version of the algorithm is used in large language model tokenizers.The original version of the algorithm focused on compression. It replaces the highest-frequency pair of bytes with a new byte that was not contained in the initial dataset. A lookup table of the replacements is required to rebuild the initial dataset. The modified version builds "tokens" (units of recognition) that match varying amounts of source text, from single characters (including single digits or single punctuation marks) to whole words (even long compound words).[5][6][7]`
+func encode(text string, merges []Merge) []int {
 	tokens := make([]int, len(text))
 	for i, b := range []byte(text) {
 		tokens[i] = int(b)
 	}
 
-	vocabSize := 279
-	numOfMerges := vocabSize - 256
+	for _, m := range merges {
+		tokens = merge(tokens, m.Pair, m.Index)
+	}
 
-	// copy original
-	original := make([]int, len(tokens))
-	copy(original, tokens)
+	return tokens
+}
+
+func buildVocab(text string) ([]int, []Merge) {
+	tokens := make([]int, len(text))
+	for i, b := range []byte(text) {
+		tokens[i] = int(b)
+	}
+
+	numOfMerges := VOCAB_SIZE - 256
 
 	merges := []Merge{}
 	for i := 0; i < numOfMerges; i++ {
 		stats := stats(tokens)
-		maxUsedPair := max(stats)
+		maxUsedPair := mostFrequentPair(stats)
 		idx := 256 + i
-		fmt.Printf("Merging pair (%d, %d) into token %d \n", maxUsedPair.First, maxUsedPair.Second, idx)
 		tokens = merge(tokens, maxUsedPair, idx)
 		merges = append(merges, Merge{maxUsedPair, idx})
 	}
 
-	fmt.Println("Original Length:", len(original))
-	fmt.Println("New Length:", len(tokens))
-	fmt.Println("Compress rate:", float64(len(original))/float64(len(tokens)))
+	return tokens, merges
+}
 
-	decoded := decode(tokens, merges)
-	fmt.Println(decoded)
+func main() {
+	trainingText := `Byte-pair encoding[1][2] (also known as BPE, or digram coding)[3] is an algorithm, first described in 1994 by Philip Gage, for encoding strings of text into smaller strings by creating and using a translation table.[4] A slightly modified version of the algorithm is used in large language model tokenizers.The original version of the algorithm focused on compression. It replaces the highest-frequency pair of bytes with a new byte that was not contained in the initial dataset. A lookup table of the replacements is required to rebuild the initial dataset. The modified version builds "tokens" (units of recognition) that match varying amounts of source text, from single characters (including single digits or single punctuation marks) to whole words (even long compound words).[5][6][7]`
 
-	fmt.Println("==================")
-	fmt.Println(decode([]int{128}, []Merge{}))
+	_, merges := buildVocab(trainingText)
+
+	fmt.Println(decode(encode("hello world", merges), merges))
 }
