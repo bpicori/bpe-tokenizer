@@ -20,8 +20,25 @@ func TestNewBPETokenizer(t *testing.T) {
 		t.Error("idToToken map should be initialized")
 	}
 
-	if tokenizer.vocabSize != 0 {
-		t.Errorf("vocabSize should be 0, got %d", tokenizer.vocabSize)
+	if tokenizer.vocabSize != 256 {
+		t.Errorf("vocabSize should be 256 (base byte vocabulary), got %d", tokenizer.vocabSize)
+	}
+
+	// Check that base vocabulary is properly initialized with all 256 bytes
+	if len(tokenizer.vocab) != 256 {
+		t.Errorf("vocab should contain 256 base tokens, got %d", len(tokenizer.vocab))
+	}
+
+	if len(tokenizer.idToToken) != 256 {
+		t.Errorf("idToToken should contain 256 base tokens, got %d", len(tokenizer.idToToken))
+	}
+
+	// Check a few specific byte mappings
+	if tokenizer.vocab[string([]byte{0})] != 0 {
+		t.Error("byte 0 should map to token 0")
+	}
+	if tokenizer.vocab[string([]byte{255})] != 255 {
+		t.Error("byte 255 should map to token 255")
 	}
 
 	if tokenizer.Merges == nil {

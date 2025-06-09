@@ -33,12 +33,20 @@ type BPETokenizer struct {
 }
 
 func NewBPETokenizer() *BPETokenizer {
-	return &BPETokenizer{
+	tokenizer := &BPETokenizer{
 		Merges:    []Merge{},
 		vocab:     make(map[string]int),
 		idToToken: make(map[int]string),
-		vocabSize: 0,
+		vocabSize: 256,
 	}
+
+	for i := 0; i < 256; i++ {
+		byteStr := string([]byte{byte(i)})
+		tokenizer.vocab[byteStr] = i
+		tokenizer.idToToken[i] = byteStr
+	}
+
+	return tokenizer
 }
 
 func (bpe *BPETokenizer) merge(list []int, pair Pair, index int) []int {
@@ -84,8 +92,12 @@ func (bpe *BPETokenizer) mostFrequentPair(m map[Pair]int) Pair {
 }
 
 func (bpe *BPETokenizer) Tokenize(text string) []int {
+	if text == "" {
+		return []int{}
+	}
+
 	re := regexp2.MustCompile(GPT4_SPLIT_PATTERN, regexp2.None)
-	tokens := []int{}
+	var allTokens []int
 	start := 0
 
 	for start < len(text) {
@@ -95,21 +107,24 @@ func (bpe *BPETokenizer) Tokenize(text string) []int {
 		}
 
 		matched := match.String()
-		if _, exists := bpe.vocab[matched]; !exists {
-			bpe.vocab[matched] = bpe.vocabSize
-			bpe.idToToken[bpe.vocabSize] = matched
-			bpe.vocabSize++
+
+		chunkBytes := []byte(matched)
+		for _, b := range chunkBytes {
+			allTokens = append(allTokens, int(b))
 		}
-		tokens = append(tokens, bpe.vocab[matched])
+
 		start += match.Index + len(matched)
 	}
 
-	return tokens
+	return allTokens
 }
 
 func (bpe *BPETokenizer) Decode(tokens []int) string {
-	localVocab := make(map[int]string)
+	if len(tokens) == 0 {
+		return ""
+	}
 
+	localVocab := make(map[int]string)
 	for id, tok := range bpe.idToToken {
 		localVocab[id] = tok
 	}
@@ -120,11 +135,14 @@ func (bpe *BPETokenizer) Decode(tokens []int) string {
 		localVocab[merge.Index] = first + second
 	}
 
-	var result string
+	var result []byte
 	for _, token := range tokens {
-		result += localVocab[token]
+		if tokenStr, exists := localVocab[token]; exists {
+			result = append(result, []byte(tokenStr)...)
+		}
 	}
-	return result
+
+	return string(result)
 }
 
 func (bpe *BPETokenizer) Encode(text string) []int {
@@ -142,8 +160,25 @@ func (bpe *BPETokenizer) Train(text string) {
 	numOfMerges := VOCAB_SIZE - 256
 	for i := 0; i < numOfMerges; i++ {
 		statsMap := bpe.stats(tokens)
-		maxUsedPair := bpe.mostFrequentPair(statsMap)
+		if len(statsMap) == 0 {
+			for j := i; j < numOfMerges; j++ {
+				dummyPair := Pair{First: 0, Second: 0}
+				idx := 256 + j
+				bpe.Merges = append(bpe.Merges, Merge{dummyPair, idx})
+			}
+			break
+		}
+
 		idx := 256 + i
+		maxUsedPair := bpe.mostFrequentPair(statsMap)
+
+		firstToken := bpe.idToToken[maxUsedPair.First]
+		secondToken := bpe.idToToken[maxUsedPair.Second]
+		mergedToken := firstToken + secondToken
+
+		bpe.vocab[mergedToken] = idx
+		bpe.idToToken[idx] = mergedToken
+
 		tokens = bpe.merge(tokens, maxUsedPair, idx)
 		bpe.Merges = append(bpe.Merges, Merge{maxUsedPair, idx})
 	}
@@ -176,6 +211,19 @@ func (bpe *BPETokenizer) Load() {
 	}
 	defer file.Close()
 
+	// Reset and reinitialize base vocabulary
+	bpe.vocab = make(map[string]int)
+	bpe.idToToken = make(map[int]string)
+	bpe.vocabSize = 256
+	bpe.Merges = []Merge{}
+
+	// Initialize base vocabulary with all 256 possible bytes
+	for i := 0; i < 256; i++ {
+		byteStr := string([]byte{byte(i)})
+		bpe.vocab[byteStr] = i
+		bpe.idToToken[i] = byteStr
+	}
+
 	scanner := bufio.NewScanner(file)
 
 	for scanner.Scan() {
@@ -183,12 +231,21 @@ func (bpe *BPETokenizer) Load() {
 		var first, second, index int
 		_, err := fmt.Sscanf(line, "%d-%d %d", &first, &second, &index)
 		if err != nil {
-			fmt.Println("Error parsing line:", line)
-			continue
+			panic(err)
 		}
-		bpe.Merges = append(bpe.Merges, Merge{
+
+		merge := Merge{
 			Pair:  Pair{First: first, Second: second},
 			Index: index,
-		})
+		}
+		bpe.Merges = append(bpe.Merges, merge)
+
+		if first < len(bpe.idToToken) && second < len(bpe.idToToken) {
+			firstToken := bpe.idToToken[first]
+			secondToken := bpe.idToToken[second]
+			mergedToken := firstToken + secondToken
+			bpe.vocab[mergedToken] = index
+			bpe.idToToken[index] = mergedToken
+		}
 	}
 }
