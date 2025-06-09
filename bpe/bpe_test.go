@@ -24,12 +24,12 @@ func TestNewBPETokenizer(t *testing.T) {
 		t.Errorf("vocabSize should be 0, got %d", tokenizer.vocabSize)
 	}
 
-	if tokenizer.merges == nil {
+	if tokenizer.Merges == nil {
 		t.Error("merges slice should be initialized")
 	}
 
-	if len(tokenizer.merges) != 0 {
-		t.Errorf("merges slice should be empty, got length %d", len(tokenizer.merges))
+	if len(tokenizer.Merges) != 0 {
+		t.Errorf("merges slice should be empty, got length %d", len(tokenizer.Merges))
 	}
 }
 
@@ -367,7 +367,7 @@ func TestDecode(t *testing.T) {
 					Pair:  Pair{First: 0, Second: 1},
 					Index: 256,
 				}
-				tokenizer.merges = append(tokenizer.merges, merge)
+				tokenizer.Merges = append(tokenizer.Merges, merge)
 
 				return []int{256} // Use the merged token
 			},
@@ -406,7 +406,7 @@ func TestEncode(t *testing.T) {
 				// Encode should apply merges, so result might be different from Tokenize
 				originalTokens := tokenizer.Tokenize("hello")
 				// If there are merges, encoded tokens might be shorter
-				if len(tokenizer.merges) > 0 && len(tokens) > len(originalTokens) {
+				if len(tokenizer.Merges) > 0 && len(tokens) > len(originalTokens) {
 					t.Error("Encoded tokens should not be longer than original tokens")
 				}
 			},
@@ -431,7 +431,7 @@ func TestEncode(t *testing.T) {
 			tokenizer.idToToken[0] = "h"
 			tokenizer.idToToken[1] = "e"
 			tokenizer.vocabSize = 2
-			tokenizer.merges = append(tokenizer.merges, Merge{
+			tokenizer.Merges = append(tokenizer.Merges, Merge{
 				Pair:  Pair{First: 0, Second: 1},
 				Index: 256,
 			})
@@ -454,12 +454,12 @@ func TestTrain(t *testing.T) {
 			validate: func(t *testing.T, tokenizer *BPETokenizer) {
 				// After training, should have merges
 				expectedMerges := VOCAB_SIZE - 256
-				if len(tokenizer.merges) != expectedMerges {
-					t.Errorf("Expected %d merges, got %d", expectedMerges, len(tokenizer.merges))
+				if len(tokenizer.Merges) != expectedMerges {
+					t.Errorf("Expected %d merges, got %d", expectedMerges, len(tokenizer.Merges))
 				}
 
 				// Merges should have valid indices starting from 256
-				for i, merge := range tokenizer.merges {
+				for i, merge := range tokenizer.Merges {
 					expectedIndex := 256 + i
 					if merge.Index != expectedIndex {
 						t.Errorf("Merge %d has index %d, expected %d", i, merge.Index, expectedIndex)
@@ -478,8 +478,8 @@ func TestTrain(t *testing.T) {
 			validate: func(t *testing.T, tokenizer *BPETokenizer) {
 				// Training on empty text should still create merges (though they might be empty)
 				expectedMerges := VOCAB_SIZE - 256
-				if len(tokenizer.merges) != expectedMerges {
-					t.Errorf("Expected %d merges even for empty text, got %d", expectedMerges, len(tokenizer.merges))
+				if len(tokenizer.Merges) != expectedMerges {
+					t.Errorf("Expected %d merges even for empty text, got %d", expectedMerges, len(tokenizer.Merges))
 				}
 			},
 		},
@@ -488,8 +488,8 @@ func TestTrain(t *testing.T) {
 			text: "a",
 			validate: func(t *testing.T, tokenizer *BPETokenizer) {
 				expectedMerges := VOCAB_SIZE - 256
-				if len(tokenizer.merges) != expectedMerges {
-					t.Errorf("Expected %d merges, got %d", expectedMerges, len(tokenizer.merges))
+				if len(tokenizer.Merges) != expectedMerges {
+					t.Errorf("Expected %d merges, got %d", expectedMerges, len(tokenizer.Merges))
 				}
 
 				// Should have at least one token in vocab
