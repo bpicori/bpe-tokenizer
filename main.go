@@ -2,9 +2,9 @@ package main
 
 import (
 	"bpicori/bpe-tokenizer/bpe"
-	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 )
@@ -12,19 +12,24 @@ import (
 func loadTrainingText() string {
 	file, err := os.Open("training_text.txt")
 	if err != nil {
-		fmt.Println("Error opening file:", err)
-		return ""
+		panic(err)
 	}
 	defer file.Close()
 
-	// read file
-	scanner := bufio.NewScanner(file)
-	var trainingText string
-	for scanner.Scan() {
-		trainingText += scanner.Text()
+	// Get file size 
+	stat, err := file.Stat()
+	if err != nil {
+		panic(err)
 	}
-
-	return trainingText
+	
+	data := make([]byte, stat.Size())
+	
+	_, err = io.ReadFull(file, data)
+	if err != nil {
+		panic(err)
+	}
+	
+	return string(data)
 }
 
 

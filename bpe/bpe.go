@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 
 	"github.com/dlclark/regexp2"
 )
@@ -22,7 +24,7 @@ type Merge struct {
 	Index int
 }
 
-const VOCAB_SIZE = 4096
+const VOCAB_SIZE = 1000 * 10
 const GPT4_SPLIT_PATTERN = `(?i:'[sdmt]|'ll|'ve|'re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+`
 
 type BPETokenizer struct {
@@ -96,26 +98,60 @@ func (bpe *BPETokenizer) Tokenize(text string) []int {
 		return []int{}
 	}
 
-	re := regexp2.MustCompile(GPT4_SPLIT_PATTERN, regexp2.None)
-	var allTokens []int
-	start := 0
-
-	for start < len(text) {
-		match, err := re.FindStringMatch(text[start:])
-		if err != nil || match == nil {
-			break
-		}
-
-		matched := match.String()
-
-		chunkBytes := []byte(matched)
-		for _, b := range chunkBytes {
-			allTokens = append(allTokens, int(b))
-		}
-
-		start += match.Index + len(matched)
+	lines := strings.Split(text, "\n")
+	
+	resultChan := make(chan []int, len(lines))
+	var wg sync.WaitGroup
+	
+	for i, line := range lines {
+		wg.Add(1)
+		go func(lineNum int, lineText string) {
+			defer wg.Done()
+			
+			if lineText == "" {
+				resultChan <- []int{} 
+				return
+			}
+			
+			var lineTokens []int
+			re := regexp2.MustCompile(GPT4_SPLIT_PATTERN, regexp2.None)
+			start := 0
+			
+			for start < len(lineText) {
+				match, err := re.FindStringMatch(lineText[start:])
+				if err != nil || match == nil {
+					break
+				}
+				
+				matched := match.String()
+				chunkBytes := []byte(matched)
+				for _, b := range chunkBytes {
+					lineTokens = append(lineTokens, int(b))
+				}
+				
+				start += match.Index + len(matched)
+			}
+			
+			// Add newline token if not the last line
+			if lineNum < len(lines)-1 {
+				lineTokens = append(lineTokens, int('\n'))
+			}
+			
+			resultChan <- lineTokens
+			fmt.Printf("Tokenized line %d/%d\n", lineNum+1, len(lines))
+		}(i, line)
 	}
-
+	
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+	
+	var allTokens []int
+	for tokens := range resultChan {
+		allTokens = append(allTokens, tokens...)
+	}
+	
 	return allTokens
 }
 
@@ -159,6 +195,7 @@ func (bpe *BPETokenizer) Train(text string) {
 	tokens := bpe.Tokenize(text)
 	numOfMerges := VOCAB_SIZE - 256
 	for i := 0; i < numOfMerges; i++ {
+		fmt.Println("Training progress:", i, "/", numOfMerges)
 		statsMap := bpe.stats(tokens)
 		if len(statsMap) == 0 {
 			for j := i; j < numOfMerges; j++ {
