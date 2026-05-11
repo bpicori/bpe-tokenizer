@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 
 	"github.com/dlclark/regexp2"
 )
+
+var splitRegex = regexp2.MustCompile(GPT4_SPLIT_PATTERN, regexp2.None)
 
 type Pair struct {
 	First  int
@@ -24,7 +27,7 @@ type Merge struct {
 	Index int
 }
 
-const VOCAB_SIZE = 256 + 100
+const VOCAB_SIZE = 256 + 1000
 const GPT4_SPLIT_PATTERN = `(?i:'[sdmt]|'ll|'ve|'re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+`
 
 type BPETokenizer struct {
@@ -52,31 +55,70 @@ func NewBPETokenizer() *BPETokenizer {
 }
 
 func (bpe *BPETokenizer) merge(list []int, pair Pair, index int) []int {
-	newList := []int{}
-
-	for i := 0; i < len(list); i++ {
-		if i < len(list)-1 && list[i] == pair.First && list[i+1] == pair.Second {
-			newList = append(newList, index)
-			i++ // skip the next element as we merged
+	w := 0
+	n := len(list)
+	for i := 0; i < n; i++ {
+		if i < n-1 && list[i] == pair.First && list[i+1] == pair.Second {
+			list[w] = index
+			w++
+			i++ 
 		} else {
-			newList = append(newList, list[i])
+			list[w] = list[i]
+			w++
 		}
 	}
-
-	return newList
+	return list[:w]
 }
 
 func (bpe *BPETokenizer) stats(tokens []int) map[Pair]int {
-	m := make(map[Pair]int)
-
-	for i := 0; i < len(tokens)-1; i++ {
-		curr := tokens[i]
-		next := tokens[i+1]
-		pair := Pair{curr, next}
-		m[pair]++
+	n := len(tokens)
+	if n < 2 {
+		return map[Pair]int{}
 	}
 
-	return m
+	workers := runtime.GOMAXPROCS(0)
+	// Below ~64k tokens the sequential path wins (sync overhead dominates).
+	if workers < 2 || n < 64*1024 {
+		m := make(map[Pair]int, n/8)
+		for i := 0; i < n-1; i++ {
+			m[Pair{tokens[i], tokens[i+1]}]++
+		}
+		return m
+	}
+
+	chunk := n / workers
+	partials := make([]map[Pair]int, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		start := w * chunk
+		end := start + chunk
+		if w == workers-1 {
+			end = n
+		}
+		// Include the boundary pair (tokens[end-1], tokens[end]) so we don't miss
+		// pairs that straddle chunk boundaries.
+		if end < n {
+			end++
+		}
+		wg.Add(1)
+		go func(idx, s, e int) {
+			defer wg.Done()
+			local := make(map[Pair]int, (e-s)/8)
+			for i := s; i < e-1; i++ {
+				local[Pair{tokens[i], tokens[i+1]}]++
+			}
+			partials[idx] = local
+		}(w, start, end)
+	}
+	wg.Wait()
+
+	out := partials[0]
+	for i := 1; i < workers; i++ {
+		for p, c := range partials[i] {
+			out[p] += c
+		}
+	}
+	return out
 }
 
 func (bpe *BPETokenizer) mostFrequentPair(m map[Pair]int) Pair {
@@ -101,66 +143,76 @@ func (bpe *BPETokenizer) mostFrequentPair(m map[Pair]int) Pair {
  * 4. Add newline token if not the last line
 **/
 func (bpe *BPETokenizer) Tokenize(text string) []int {
-	fmt.Println("Starting Tokenize")
 	if text == "" {
+		fmt.Println("Tokenize: empty input, nothing to do")
 		return []int{}
 	}
 
 	lines := strings.Split(text, "\n")
+	lineTokens := make([][]int, len(lines))
 
-	resultChan := make(chan []int, len(lines))
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(lines) {
+		workers = len(lines)
+	}
+
+	fmt.Printf("Tokenize: starting (%d lines, %d workers)\n", len(lines), workers)
+
+	jobs := make(chan int, workers*2)
 	var wg sync.WaitGroup
-
-	for i, line := range lines {
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
-		go func(lineNum int, lineText string) {
+		go func() {
 			defer wg.Done()
-
-			if lineText == "" {
-				resultChan <- []int{}
-				return
+			for i := range jobs {
+				lineTokens[i] = tokenizeLine(lines[i], i < len(lines)-1)
 			}
+		}()
+	}
+	for i := range lines {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
 
-			var lineTokens []int
-			re := regexp2.MustCompile(GPT4_SPLIT_PATTERN, regexp2.None)
-			start := 0
-
-			for start < len(lineText) {
-				match, err := re.FindStringMatch(lineText[start:])
-				if err != nil || match == nil {
-					break
-				}
-
-				matched := match.String()
-				chunkBytes := []byte(matched)
-				for _, b := range chunkBytes {
-					lineTokens = append(lineTokens, int(b))
-				}
-
-				start += match.Index + len(matched)
-			}
-
-			// Add newline token if not the last line
-			if lineNum < len(lines)-1 {
-				lineTokens = append(lineTokens, int('\n'))
-			}
-
-			resultChan <- lineTokens
-		}(i, line)
+	total := 0
+	for _, t := range lineTokens {
+		total += len(t)
+	}
+	allTokens := make([]int, 0, total)
+	for _, t := range lineTokens {
+		allTokens = append(allTokens, t...)
 	}
 
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	var allTokens []int
-	for tokens := range resultChan {
-		allTokens = append(allTokens, tokens...)
-	}
-
-	fmt.Println("Finished Tokenize")
+	fmt.Printf("Tokenize: finished (%d lines -> %d tokens)\n", len(lines), len(allTokens))
 	return allTokens
+}
+
+func tokenizeLine(lineText string, appendNewline bool) []int {
+	if lineText == "" {
+		if appendNewline {
+			return []int{int('\n')}
+		}
+		return nil
+	}
+
+	out := make([]int, 0, len(lineText)+1)
+	start := 0
+	for start < len(lineText) {
+		match, err := splitRegex.FindStringMatch(lineText[start:])
+		if err != nil || match == nil {
+			break
+		}
+		matched := match.String()
+		for i := 0; i < len(matched); i++ {
+			out = append(out, int(matched[i]))
+		}
+		start += match.Index + len(matched)
+	}
+	if appendNewline {
+		out = append(out, int('\n'))
+	}
+	return out
 }
 
 /**
@@ -215,7 +267,6 @@ func (bpe *BPETokenizer) Train(text string) {
 	tokens := bpe.Tokenize(text)
 	numOfMerges := VOCAB_SIZE - 256
 	for i := 0; i < numOfMerges; i++ {
-		fmt.Println("Merging number: ", i)
 		statsMap := bpe.stats(tokens)
 		if len(statsMap) == 0 {
 			for j := i; j < numOfMerges; j++ {
@@ -235,6 +286,13 @@ func (bpe *BPETokenizer) Train(text string) {
 
 		bpe.vocab[mergedToken] = idx
 		bpe.idToToken[idx] = mergedToken
+
+		fmt.Printf("Merge %d/%d: (%d, %d) %q + %q -> %d %q (count=%d)\n",
+			i+1, numOfMerges,
+			maxUsedPair.First, maxUsedPair.Second,
+			firstToken, secondToken,
+			idx, mergedToken,
+			statsMap[maxUsedPair])
 
 		tokens = bpe.merge(tokens, maxUsedPair, idx)
 		bpe.Merges = append(bpe.Merges, Merge{maxUsedPair, idx})
