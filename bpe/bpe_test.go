@@ -152,12 +152,12 @@ func TestStats(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		tokens   []int
+		chunks   [][]int
 		expected map[Pair]int
 	}{
 		{
-			name:   "simple sequence",
-			tokens: []int{1, 2, 3, 4},
+			name:   "simple sequence (one chunk)",
+			chunks: [][]int{{1, 2, 3, 4}},
 			expected: map[Pair]int{
 				{1, 2}: 1,
 				{2, 3}: 1,
@@ -165,8 +165,8 @@ func TestStats(t *testing.T) {
 			},
 		},
 		{
-			name:   "repeated pairs",
-			tokens: []int{1, 2, 1, 2, 3},
+			name:   "repeated pairs (one chunk)",
+			chunks: [][]int{{1, 2, 1, 2, 3}},
 			expected: map[Pair]int{
 				{1, 2}: 2,
 				{2, 1}: 1,
@@ -175,26 +175,43 @@ func TestStats(t *testing.T) {
 		},
 		{
 			name:     "single token",
-			tokens:   []int{1},
+			chunks:   [][]int{{1}},
 			expected: map[Pair]int{},
 		},
 		{
-			name:     "empty tokens",
-			tokens:   []int{},
+			name:     "empty chunks",
+			chunks:   [][]int{},
 			expected: map[Pair]int{},
 		},
 		{
-			name:   "two tokens",
-			tokens: []int{1, 2},
+			name:   "two tokens (one chunk)",
+			chunks: [][]int{{1, 2}},
 			expected: map[Pair]int{
 				{1, 2}: 1,
+			},
+		},
+		{
+			name:   "boundary pair not counted across chunks",
+			chunks: [][]int{{1, 2}, {3, 4}},
+			expected: map[Pair]int{
+				{1, 2}: 1,
+				{3, 4}: 1,
+			},
+		},
+		{
+			name:   "same pair counted across multiple chunks",
+			chunks: [][]int{{1, 2, 3}, {9}, {1, 2, 5}},
+			expected: map[Pair]int{
+				{1, 2}: 2,
+				{2, 3}: 1,
+				{2, 5}: 1,
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := tokenizer.stats(tt.tokens)
+			result := tokenizer.stats(tt.chunks)
 			if !reflect.DeepEqual(result, tt.expected) {
 				t.Errorf("stats() = %v, want %v", result, tt.expected)
 			}
@@ -262,24 +279,21 @@ func TestTokenize(t *testing.T) {
 	tests := []struct {
 		name     string
 		text     string
-		validate func(*testing.T, *BPETokenizer, []int)
+		validate func(*testing.T, *BPETokenizer, [][]int)
 	}{
 		{
 			name: "simple text",
 			text: "hello world",
-			validate: func(t *testing.T, tokenizer *BPETokenizer, tokens []int) {
-				if len(tokens) == 0 {
-					t.Error("Expected non-empty tokens")
+			validate: func(t *testing.T, tokenizer *BPETokenizer, chunks [][]int) {
+				if len(chunks) == 0 {
+					t.Error("Expected non-empty chunks")
 				}
-				// Check that vocab was populated
 				if len(tokenizer.vocab) == 0 {
 					t.Error("Expected vocab to be populated")
 				}
-				// Check that idToToken was populated
 				if len(tokenizer.idToToken) == 0 {
 					t.Error("Expected idToToken to be populated")
 				}
-				// Check that vocabSize matches
 				if tokenizer.vocabSize != len(tokenizer.vocab) {
 					t.Errorf("vocabSize (%d) should match vocab length (%d)", tokenizer.vocabSize, len(tokenizer.vocab))
 				}
@@ -288,36 +302,45 @@ func TestTokenize(t *testing.T) {
 		{
 			name: "empty text",
 			text: "",
-			validate: func(t *testing.T, tokenizer *BPETokenizer, tokens []int) {
-				if len(tokens) != 0 {
-					t.Errorf("Expected empty tokens for empty text, got %v", tokens)
+			validate: func(t *testing.T, tokenizer *BPETokenizer, chunks [][]int) {
+				if len(chunks) != 0 {
+					t.Errorf("Expected empty chunks for empty text, got %v", chunks)
 				}
 			},
 		},
 		{
 			name: "text with numbers",
 			text: "hello 123 world",
-			validate: func(t *testing.T, tokenizer *BPETokenizer, tokens []int) {
-				if len(tokens) == 0 {
-					t.Error("Expected non-empty tokens")
-				}
-				// Should have multiple tokens due to the pattern
-				if len(tokens) < 2 {
-					t.Error("Expected multiple tokens for mixed text")
+			validate: func(t *testing.T, tokenizer *BPETokenizer, chunks [][]int) {
+				if len(chunks) < 2 {
+					t.Error("Expected multiple chunks for mixed text")
 				}
 			},
 		},
 		{
 			name: "repeated text",
 			text: "hello hello",
-			validate: func(t *testing.T, tokenizer *BPETokenizer, tokens []int) {
-				if len(tokens) < 2 {
-					t.Error("Expected at least 2 tokens")
+			validate: func(t *testing.T, tokenizer *BPETokenizer, chunks [][]int) {
+				if len(chunks) < 2 {
+					t.Error("Expected at least 2 chunks")
 				}
-				// The same word should get the same token ID
-				// We can't predict exact structure due to regex complexity, but vocab should be consistent
 				if len(tokenizer.vocab) == 0 {
 					t.Error("Expected vocab to be populated")
+				}
+			},
+		},
+		{
+			name: "punctuation lives in its own chunk",
+			text: "cat, cat",
+			validate: func(t *testing.T, tokenizer *BPETokenizer, chunks [][]int) {
+				// «cat» «,» « cat»
+				expected := [][]int{
+					{int('c'), int('a'), int('t')},
+					{int(',')},
+					{int(' '), int('c'), int('a'), int('t')},
+				}
+				if !reflect.DeepEqual(chunks, expected) {
+					t.Errorf("Tokenize(%q) = %v, want %v", "cat, cat", chunks, expected)
 				}
 			},
 		},
@@ -326,8 +349,8 @@ func TestTokenize(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tokenizer := NewBPETokenizer()
-			tokens := tokenizer.Tokenize(tt.text)
-			tt.validate(t, tokenizer, tokens)
+			chunks := tokenizer.Tokenize(tt.text)
+			tt.validate(t, tokenizer, chunks)
 		})
 	}
 }
@@ -420,11 +443,13 @@ func TestEncode(t *testing.T) {
 				if len(tokens) == 0 {
 					t.Error("Expected non-empty tokens")
 				}
-				// Encode should apply merges, so result might be different from Tokenize
-				originalTokens := tokenizer.Tokenize("hello")
-				// If there are merges, encoded tokens might be shorter
-				if len(tokenizer.Merges) > 0 && len(tokens) > len(originalTokens) {
-					t.Error("Encoded tokens should not be longer than original tokens")
+				originalChunks := tokenizer.Tokenize("hello")
+				originalLen := 0
+				for _, c := range originalChunks {
+					originalLen += len(c)
+				}
+				if len(tokenizer.Merges) > 0 && len(tokens) > originalLen {
+					t.Error("Encoded tokens should not be longer than original bytes")
 				}
 			},
 		},

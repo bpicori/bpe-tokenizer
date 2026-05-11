@@ -70,42 +70,48 @@ func (bpe *BPETokenizer) merge(list []int, pair Pair, index int) []int {
 	return list[:w]
 }
 
-func (bpe *BPETokenizer) stats(tokens []int) map[Pair]int {
-	n := len(tokens)
-	if n < 2 {
+// stats counts adjacent-pair frequencies *within* each chunk.
+// Pairs that would span a chunk boundary are never counted — that's the whole
+// reason Tokenize returns [][]int instead of a flat []int. See Tokenize's doc.
+func (bpe *BPETokenizer) stats(chunks [][]int) map[Pair]int {
+	totalLen := 0
+	for _, c := range chunks {
+		totalLen += len(c)
+	}
+	if totalLen < 2 {
 		return map[Pair]int{}
 	}
 
 	workers := runtime.GOMAXPROCS(0)
-	// Below ~64k tokens the sequential path wins (sync overhead dominates).
-	if workers < 2 || n < 64*1024 {
-		m := make(map[Pair]int, n/8)
-		for i := 0; i < n-1; i++ {
-			m[Pair{tokens[i], tokens[i+1]}]++
+	if workers < 2 || totalLen < 64*1024 || len(chunks) < workers {
+		m := make(map[Pair]int, totalLen/8)
+		for _, chunk := range chunks {
+			for i := 0; i < len(chunk)-1; i++ {
+				m[Pair{chunk[i], chunk[i+1]}]++
+			}
 		}
 		return m
 	}
 
-	chunk := n / workers
+	n := len(chunks)
+	per := n / workers
 	partials := make([]map[Pair]int, workers)
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
-		start := w * chunk
-		end := start + chunk
+		start := w * per
+		end := start + per
 		if w == workers-1 {
 			end = n
-		}
-		// Include the boundary pair (tokens[end-1], tokens[end]) so we don't miss
-		// pairs that straddle chunk boundaries.
-		if end < n {
-			end++
 		}
 		wg.Add(1)
 		go func(idx, s, e int) {
 			defer wg.Done()
-			local := make(map[Pair]int, (e-s)/8)
-			for i := s; i < e-1; i++ {
-				local[Pair{tokens[i], tokens[i+1]}]++
+			local := make(map[Pair]int)
+			for i := s; i < e; i++ {
+				chunk := chunks[i]
+				for j := 0; j < len(chunk)-1; j++ {
+					local[Pair{chunk[j], chunk[j+1]}]++
+				}
 			}
 			partials[idx] = local
 		}(w, start, end)
@@ -135,21 +141,37 @@ func (bpe *BPETokenizer) mostFrequentPair(m map[Pair]int) Pair {
 	return maxPair
 }
 
-/**
- * Tokenize text into bytes
- * 1. Split text into lines
- * 2. For each line, split into chunks using GPT4_SPLIT_PATTERN
- * 3. For each chunk, convert bytes to int
- * 4. Add newline token if not the last line
-**/
-func (bpe *BPETokenizer) Tokenize(text string) []int {
+// Tokenize splits text into byte-level chunks bounded by GPT4_SPLIT_PATTERN.
+//
+// Returns [][]int where each inner slice is one regex chunk, expanded into its
+// raw bytes (0–255). Chunk boundaries are preserved on purpose: downstream BPE
+// (stats, merge, Encode) iterates *inside* each chunk only, so a pair can
+// never span the boundary the regex drew.
+//
+// Why this matters — worked example. Input: "cat, cat"
+//
+//	regex chunks:    «cat»          «,»     « cat»
+//	returned:        {99,97,116}    {44}    {32,99,97,116}
+//
+// During training, stats counts pairs *within* each chunk:
+//
+//	from «cat»:     (c,a)=1, (a,t)=1
+//	from «,»:       (nothing — single byte)
+//	from « cat»:    ( ,c)=1, (c,a)=1, (a,t)=1
+//
+// Numbers: the regex caps digit runs at 3, so "12345" becomes two chunks
+// {49,50,51} and {52,53} — BPE can never produce one giant "12345" token.
+//
+// Newlines: text is split on '\n' first, and a single-byte chunk {10} is
+// inserted between lines so newlines act as hard boundaries too.
+func (bpe *BPETokenizer) Tokenize(text string) [][]int {
 	if text == "" {
 		fmt.Println("Tokenize: empty input, nothing to do")
-		return []int{}
+		return [][]int{}
 	}
 
 	lines := strings.Split(text, "\n")
-	lineTokens := make([][]int, len(lines))
+	lineChunks := make([][][]int, len(lines))
 
 	workers := runtime.GOMAXPROCS(0)
 	if workers > len(lines) {
@@ -165,7 +187,7 @@ func (bpe *BPETokenizer) Tokenize(text string) []int {
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
-				lineTokens[i] = tokenizeLine(lines[i], i < len(lines)-1)
+				lineChunks[i] = tokenizeLine(lines[i], i < len(lines)-1)
 			}
 		}()
 	}
@@ -175,28 +197,32 @@ func (bpe *BPETokenizer) Tokenize(text string) []int {
 	close(jobs)
 	wg.Wait()
 
-	total := 0
-	for _, t := range lineTokens {
-		total += len(t)
+	totalChunks := 0
+	totalBytes := 0
+	for _, lc := range lineChunks {
+		totalChunks += len(lc)
+		for _, c := range lc {
+			totalBytes += len(c)
+		}
 	}
-	allTokens := make([]int, 0, total)
-	for _, t := range lineTokens {
-		allTokens = append(allTokens, t...)
+	all := make([][]int, 0, totalChunks)
+	for _, lc := range lineChunks {
+		all = append(all, lc...)
 	}
 
-	fmt.Printf("Tokenize: finished (%d lines -> %d tokens)\n", len(lines), len(allTokens))
-	return allTokens
+	fmt.Printf("Tokenize: finished (%d lines -> %d chunks, %d bytes)\n", len(lines), len(all), totalBytes)
+	return all
 }
 
-func tokenizeLine(lineText string, appendNewline bool) []int {
+func tokenizeLine(lineText string, appendNewline bool) [][]int {
 	if lineText == "" {
 		if appendNewline {
-			return []int{int('\n')}
+			return [][]int{{int('\n')}}
 		}
 		return nil
 	}
 
-	out := make([]int, 0, len(lineText)+1)
+	var chunks [][]int
 	start := 0
 	for start < len(lineText) {
 		match, err := splitRegex.FindStringMatch(lineText[start:])
@@ -204,15 +230,17 @@ func tokenizeLine(lineText string, appendNewline bool) []int {
 			break
 		}
 		matched := match.String()
+		chunk := make([]int, 0, len(matched))
 		for i := 0; i < len(matched); i++ {
-			out = append(out, int(matched[i]))
+			chunk = append(chunk, int(matched[i]))
 		}
+		chunks = append(chunks, chunk)
 		start += match.Index + len(matched)
 	}
 	if appendNewline {
-		out = append(out, int('\n'))
+		chunks = append(chunks, []int{int('\n')})
 	}
-	return out
+	return chunks
 }
 
 /**
@@ -247,27 +275,36 @@ func (bpe *BPETokenizer) Decode(tokens []int) string {
 	return string(result)
 }
 
-/**
- * Encode text into tokens
- * 1. Tokenize text into bytes
- * 2. For each merge, apply merge to tokens
-**/
+// Encode text into tokens.
+//
+// Pre-split into chunks via Tokenize, apply every learned merge *inside* each
+// chunk, then concatenate the chunks into one flat []int. Merges never glue
+// bytes across chunk boundaries because each call to merge sees only one
+// chunk's slice.
 func (bpe *BPETokenizer) Encode(text string) []int {
-	tokens := bpe.Tokenize(text)
+	chunks := bpe.Tokenize(text)
 
-	for _, m := range bpe.Merges {
-		tokens = bpe.merge(tokens, m.Pair, m.Index)
+	total := 0
+	for i := range chunks {
+		for _, m := range bpe.Merges {
+			chunks[i] = bpe.merge(chunks[i], m.Pair, m.Index)
+		}
+		total += len(chunks[i])
 	}
 
-	return tokens
+	out := make([]int, 0, total)
+	for _, c := range chunks {
+		out = append(out, c...)
+	}
+	return out
 }
 
 func (bpe *BPETokenizer) Train(text string) {
 	fmt.Println("Starting Training")
-	tokens := bpe.Tokenize(text)
+	chunks := bpe.Tokenize(text)
 	numOfMerges := VOCAB_SIZE - 256
 	for i := 0; i < numOfMerges; i++ {
-		statsMap := bpe.stats(tokens)
+		statsMap := bpe.stats(chunks)
 		if len(statsMap) == 0 {
 			for j := i; j < numOfMerges; j++ {
 				dummyPair := Pair{First: 0, Second: 0}
@@ -294,7 +331,9 @@ func (bpe *BPETokenizer) Train(text string) {
 			idx, mergedToken,
 			statsMap[maxUsedPair])
 
-		tokens = bpe.merge(tokens, maxUsedPair, idx)
+		for j := range chunks {
+			chunks[j] = bpe.merge(chunks[j], maxUsedPair, idx)
+		}
 		bpe.Merges = append(bpe.Merges, Merge{maxUsedPair, idx})
 	}
 	fmt.Println("Finished Training")
