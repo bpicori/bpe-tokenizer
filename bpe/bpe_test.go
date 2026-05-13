@@ -6,10 +6,10 @@ import (
 )
 
 func TestNewBPETokenizer(t *testing.T) {
-	tokenizer := NewBPETokenizer()
+	tokenizer := NewBPETokenizer(nil)
 
 	if tokenizer == nil {
-		t.Fatal("NewBPETokenizer() returned nil")
+		t.Fatal("NewBPETokenizer(nil) returned nil")
 	}
 
 	if tokenizer.vocab == nil {
@@ -84,7 +84,7 @@ func TestPairString(t *testing.T) {
 }
 
 func TestMerge(t *testing.T) {
-	tokenizer := NewBPETokenizer()
+	tokenizer := NewBPETokenizer(nil)
 
 	tests := []struct {
 		name     string
@@ -148,7 +148,7 @@ func TestMerge(t *testing.T) {
 }
 
 func TestStats(t *testing.T) {
-	tokenizer := NewBPETokenizer()
+	tokenizer := NewBPETokenizer(nil)
 
 	tests := []struct {
 		name     string
@@ -220,7 +220,7 @@ func TestStats(t *testing.T) {
 }
 
 func TestMostFrequentPair(t *testing.T) {
-	tokenizer := NewBPETokenizer()
+	tokenizer := NewBPETokenizer(nil)
 
 	tests := []struct {
 		name     string
@@ -348,7 +348,7 @@ func TestTokenize(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tokenizer := NewBPETokenizer()
+			tokenizer := NewBPETokenizer(nil)
 			chunks := tokenizer.Tokenize(tt.text)
 			tt.validate(t, tokenizer, chunks)
 		})
@@ -422,7 +422,7 @@ func TestDecode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tokenizer := NewBPETokenizer()
+			tokenizer := NewBPETokenizer(nil)
 			tokens := tt.setup(tokenizer)
 			result := tokenizer.Decode(tokens)
 			tt.validate(t, result)
@@ -466,7 +466,7 @@ func TestEncode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tokenizer := NewBPETokenizer()
+			tokenizer := NewBPETokenizer(nil)
 			// Add some dummy merges to test the encoding process
 			tokenizer.vocab["h"] = 0
 			tokenizer.vocab["e"] = 1
@@ -544,7 +544,7 @@ func TestTrain(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tokenizer := NewBPETokenizer()
+			tokenizer := NewBPETokenizer(nil)
 			tokenizer.Train(tt.text)
 			tt.validate(t, tokenizer)
 		})
@@ -553,7 +553,7 @@ func TestTrain(t *testing.T) {
 
 func TestIntegration(t *testing.T) {
 	// Test the full pipeline: Train -> Encode -> Decode
-	tokenizer := NewBPETokenizer()
+	tokenizer := NewBPETokenizer(nil)
 	text := "hello world hello world"
 
 	// Train the tokenizer

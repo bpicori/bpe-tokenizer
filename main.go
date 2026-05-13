@@ -9,8 +9,10 @@ import (
 	"strings"
 )
 
-func loadTrainingText() string {
-	file, err := os.Open("training_text.txt")
+var SpecialTokens = []string{"<|endoftext|>"}
+
+func loadTrainingText(path string) string {
+	file, err := os.Open(path)
 	if err != nil {
 		panic(err)
 	}
@@ -38,22 +40,30 @@ func main() {
 	encodeCmd := flag.NewFlagSet("encode", flag.ExitOnError)
 	decodeCmd := flag.NewFlagSet("decode", flag.ExitOnError)
 
+	trainFile := trainCmd.String("file", "", "Path to the training-text file (required)")
 	encodeInput := encodeCmd.String("text", "", "Text to encode")
 	decodeInput := decodeCmd.String("ids", "", "Space-separated list of token IDs to decode")
 
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: bpe-tokenizer <command> [arguments]")
-		fmt.Println("Commands: train, encode -text=\"<text>\", decode -ids=\"<id1 id2 ...>\"")
+		fmt.Println("Commands:")
+		fmt.Println("  train  -file=\"<path>\"           Train on the given text file (required)")
+		fmt.Println("  encode -text=\"<text>\"           Encode a string into token IDs")
+		fmt.Println("  decode -ids=\"<id1 id2 ...>\"     Decode a space-separated list of IDs back to text")
 		return
 	}
 
 	command := os.Args[1]
-	bpe := bpe.NewBPETokenizer()
+	bpe := bpe.NewBPETokenizer(SpecialTokens)
 
 	switch command {
 	case "train":
 		trainCmd.Parse(os.Args[2:])
-		trainingText := loadTrainingText()
+		if *trainFile == "" {
+			fmt.Println("Usage: bpe-tokenizer train -file=\"<path>\"")
+			os.Exit(1)
+		}
+		trainingText := loadTrainingText(*trainFile)
 		bpe.Train(trainingText)
 		bpe.Save()
 		fmt.Println("Training completed and model saved.")

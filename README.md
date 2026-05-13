@@ -1,38 +1,54 @@
 # BPE Tokenizer
 
-A **Byte Pair Encoding (BPE)** tokenizer implementation in Go that follows GPT-4's tokenization approach. Build custom vocabularies, encode text to tokens, and decode tokens back to text.
+A **byte-level Byte Pair Encoding (BPE)** tokenizer in Go, following GPT-4's
+pre-tokenization regex and supporting reserved special tokens (e.g.
+`<|endoftext|>`) that are never split or merged.
 
-## Quick Start
+## Quick start
 
-### Installation
 ```bash
 go mod download
 make build
 ```
 
-### Usage
 ```bash
-# 1. Get training data (optional - uses Simple Wikipedia) or provide your own in training_text.txt
-make download-dataset
-
-# 2. Train the tokenizer
-./bpe-tokenizer train
-
-# 3. Encode text to tokens
-./bpe-tokenizer encode --text="hello world"
-# Output: [104 9349 1294]
-
-# 4. Decode tokens back to text
-./bpe-tokenizer decode -ids="104 9349 1294"
-# Output: hello world
+./bin/bpe-tokenizer train -file=<path>
+./bin/bpe-tokenizer encode -text="hello world"   # → [104 9349 1294]
+./bin/bpe-tokenizer decode -ids="104 9349 1294"  # → hello world
 ```
+
+`encode` and `decode` load `vocab.model` from the current directory, so run
+`train` first.
+
+## Datasets
+
+```bash
+make download-dataset       # Simple Wikipedia, ~few MB — quick sanity check
+make download-tinystories   # TinyStories, ~2 GB → data/TinyStoriesV2-GPT4-*.txt
+make download-openwebtext   # OpenWebText sample, ~12 GB raw → data/owt_*.txt
+```
+
+## Special tokens
+
+`<|endoftext|>` is reserved by default (`main.go`) and gets a fixed ID right
+after the byte range (`256`). To register a different set:
+
+```go
+bpe.NewBPETokenizer([]string{"<|endoftext|>", "<|other|>", ...})
+```
+
+IDs are assigned in order (`256`, `257`, …) and persisted in `vocab.model`.
 
 ## Configuration
 
-Modify constants in `bpe/bpe.go`:
-- `VOCAB_SIZE`: Total vocabulary size (default: 10,000)
-- `GPT4_SPLIT_PATTERN`: Text splitting regex
+In `bpe/bpe.go`:
+
+- `VOCAB_SIZE` — total vocabulary size (default `10_000`). Merge count is
+  `VOCAB_SIZE − 256 − len(specialTokens)`.
+- `GPT4_SPLIT_PATTERN` — pre-tokenization regex (mirrors tiktoken's
+  `cl100k_base`).
 
 ## References
-* https://www.youtube.com/watch?v=zduSFxRajkE
-* https://github.com/karpathy/minbpe
+
+- Karpathy, *minbpe* — https://github.com/karpathy/minbpe
+- *Let's build the GPT Tokenizer* — https://www.youtube.com/watch?v=zduSFxRajkE
