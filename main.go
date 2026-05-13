@@ -4,35 +4,11 @@ import (
 	"bpicori/bpe-tokenizer/bpe"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 )
 
 var SpecialTokens = []string{"<|endoftext|>"}
-
-func loadTrainingText(path string) string {
-	file, err := os.Open(path)
-	if err != nil {
-		panic(err)
-	}
-	defer file.Close()
-
-	// Get file size 
-	stat, err := file.Stat()
-	if err != nil {
-		panic(err)
-	}
-	
-	data := make([]byte, stat.Size())
-	
-	_, err = io.ReadFull(file, data)
-	if err != nil {
-		panic(err)
-	}
-	
-	return string(data)
-}
 
 
 func main() {
@@ -63,8 +39,12 @@ func main() {
 			fmt.Println("Usage: bpe-tokenizer train -file=\"<path>\"")
 			os.Exit(1)
 		}
-		trainingText := loadTrainingText(*trainFile)
-		bpe.Train(trainingText)
+		file, err := os.Open(*trainFile)
+		if err != nil {
+			panic(err)
+		}
+		bpe.Train(file)
+		file.Close()
 		bpe.Save()
 		fmt.Println("Training completed and model saved.")
 

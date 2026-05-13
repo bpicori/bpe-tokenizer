@@ -3,13 +3,14 @@ package bpe
 import (
 	"bufio"
 	"fmt"
+	"io"
+	"maps"
 	"os"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
-
-	"github.com/dlclark/regexp2"
 )
 
 type Pair struct {
@@ -26,26 +27,33 @@ type Merge struct {
 	Index int
 }
 
-// VOCAB_SIZE is the target *total* vocabulary size: 256 base byte tokens, plus
-// any special tokens, plus learned BPE merges. Train computes the number of
-// merges as VOCAB_SIZE - mergeStart, where mergeStart already accounts for
-// the byte range and the special-token range (set in NewBPETokenizer).
-const VOCAB_SIZE = 10_000
-const GPT4_SPLIT_PATTERN = `(?i:'[sdmt]|'ll|'ve|'re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+`
-
-type BPETokenizer struct {
-	vocab         map[string]int     // {hello: 0, world: 1, ...} - used to check if a word is already tokenized
-	idToToken     map[int]string     // {0: hello, 1: world, ...} - used to decode tokens
-	vocabSize     int
-	Merges        []Merge
-	specialTokens []string           // reserved tokens with fixed IDs starting at 256; never merged
-	mergeStart    int                // first ID available to learned BPE merges (256 + len(specialTokens))
-	splitRegex    *regexp2.Regexp    // pre-tokenization regex, with specials prepended as alternatives
+// Word is a unique chunk and its frequency. Training counts each pair once
+// and weights by Count, e.g. " the" x 1_000_000 contributes (' ', 't')+=1M.
+type Word struct {
+	Tokens []int
+	Count  int
 }
 
-// NewBPETokenizer constructs a tokenizer with the 256 raw-byte base vocabulary.
-// Special tokens get fixed IDs 256, 257, ... and are excluded from BPE merging.
-// Learned merges start at mergeStart and grow upward.
+// VocabSize = 256 bytes + specials + learned merges.
+const VocabSize = 20_000
+
+// GPT4SplitPattern pre-tokenization regex. RE2 has no lookaround, so the original
+// `\s+(?!\S)` is rewritten as `\s+$` — equivalent because we tokenize one
+// line at a time.
+const GPT4SplitPattern = `(?i:'[sdmt]|'ll|'ve|'re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+$|\s+`
+
+type BPETokenizer struct {
+	vocab         map[string]int // "the" -> 1234
+	idToToken     map[int]string // 1234 -> "the"
+	vocabSize     int
+	Merges        []Merge
+	specialTokens []string // fixed IDs [256, mergeStart); never merged
+	mergeStart    int      // first ID for learned merges
+	splitRegex    *regexp.Regexp
+}
+
+// NewBPETokenizer seeds the vocab with 256 byte tokens and the given specials.
+// IDs: bytes [0,256), specials [256, 256+len(specials)), merges [mergeStart, ...).
 func NewBPETokenizer(specialTokens []string) *BPETokenizer {
 	tokenizer := &BPETokenizer{
 		Merges:        []Merge{},
@@ -57,7 +65,7 @@ func NewBPETokenizer(specialTokens []string) *BPETokenizer {
 		splitRegex:    buildSplitRegex(specialTokens),
 	}
 
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		byteStr := string([]byte{byte(i)})
 		tokenizer.vocab[byteStr] = i
 		tokenizer.idToToken[i] = byteStr
@@ -72,144 +80,16 @@ func NewBPETokenizer(specialTokens []string) *BPETokenizer {
 	return tokenizer
 }
 
-// buildSplitRegex prepends each special token as a top-priority alternative to
-// the GPT-4 split pattern. Longer specials come first so that overlapping
-// tokens (e.g. "<|end|>" vs "<|endoftext|>") prefer the longer match — regexp2
-// is .NET-flavored, so alternation is leftmost-first, not POSIX-longest.
-func buildSplitRegex(specialTokens []string) *regexp2.Regexp {
-	if len(specialTokens) == 0 {
-		return regexp2.MustCompile(GPT4_SPLIT_PATTERN, regexp2.None)
-	}
-	sorted := append([]string{}, specialTokens...)
-	sort.SliceStable(sorted, func(i, j int) bool { return len(sorted[i]) > len(sorted[j]) })
-	alts := make([]string, 0, len(sorted))
-	for _, t := range sorted {
-		if t != "" {
-			alts = append(alts, regexp2.Escape(t))
-		}
-	}
-	pattern := "(?:" + strings.Join(alts, "|") + ")|" + GPT4_SPLIT_PATTERN
-	return regexp2.MustCompile(pattern, regexp2.None)
-}
-
-func (bpe *BPETokenizer) merge(list []int, pair Pair, index int) []int {
-	w := 0
-	n := len(list)
-	for i := 0; i < n; i++ {
-		if i < n-1 && list[i] == pair.First && list[i+1] == pair.Second {
-			list[w] = index
-			w++
-			i++ 
-		} else {
-			list[w] = list[i]
-			w++
-		}
-	}
-	return list[:w]
-}
-
-// stats counts adjacent-pair frequencies *within* each chunk.
-// Pairs that would span a chunk boundary are never counted — that's the whole
-// reason Tokenize returns [][]int instead of a flat []int. See Tokenize's doc.
-func (bpe *BPETokenizer) stats(chunks [][]int) map[Pair]int {
-	totalLen := 0
-	for _, c := range chunks {
-		totalLen += len(c)
-	}
-	if totalLen < 2 {
-		return map[Pair]int{}
-	}
-
-	workers := runtime.GOMAXPROCS(0)
-	if workers < 2 || totalLen < 64*1024 || len(chunks) < workers {
-		m := make(map[Pair]int, totalLen/8)
-		for _, chunk := range chunks {
-			for i := 0; i < len(chunk)-1; i++ {
-				m[Pair{chunk[i], chunk[i+1]}]++
-			}
-		}
-		return m
-	}
-
-	n := len(chunks)
-	per := n / workers
-	partials := make([]map[Pair]int, workers)
-	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		start := w * per
-		end := start + per
-		if w == workers-1 {
-			end = n
-		}
-		wg.Add(1)
-		go func(idx, s, e int) {
-			defer wg.Done()
-			local := make(map[Pair]int)
-			for i := s; i < e; i++ {
-				chunk := chunks[i]
-				for j := 0; j < len(chunk)-1; j++ {
-					local[Pair{chunk[j], chunk[j+1]}]++
-				}
-			}
-			partials[idx] = local
-		}(w, start, end)
-	}
-	wg.Wait()
-
-	out := partials[0]
-	for i := 1; i < workers; i++ {
-		for p, c := range partials[i] {
-			out[p] += c
-		}
-	}
-	return out
-}
-
-func (bpe *BPETokenizer) mostFrequentPair(m map[Pair]int) Pair {
-	max := 0
-	maxPair := Pair{}
-
-	for pair, count := range m {
-		if count > max {
-			max = count
-			maxPair = pair
-		}
-	}
-
-	return maxPair
-}
-
-// Tokenize splits text into byte-level chunks bounded by GPT4_SPLIT_PATTERN.
+// Tokenize splits text into byte-level chunks using the GPT-4 regex.
+// Each chunk is bytes (0–255); pairs never cross chunk boundaries.
 //
-// Returns [][]int where each inner slice is one regex chunk, expanded into its
-// raw bytes (0–255). Chunk boundaries are preserved on purpose: downstream BPE
-// (stats, merge, Encode) iterates *inside* each chunk only, so a pair can
-// never span the boundary the regex drew.
+// Example "cat, cat" -> [{99,97,116}, {44}, {32,99,97,116}]
 //
-// Why this matters — worked example. Input: "cat, cat"
+//	(«cat»)       («,») (« cat»)
 //
-//	regex chunks:    «cat»          «,»     « cat»
-//	returned:        {99,97,116}    {44}    {32,99,97,116}
-//
-// During training, stats counts pairs *within* each chunk:
-//
-//	from «cat»:     (c,a)=1, (a,t)=1
-//	from «,»:       (nothing — single byte)
-//	from « cat»:    ( ,c)=1, (c,a)=1, (a,t)=1
-//
-// Numbers: the regex caps digit runs at 3, so "12345" becomes two chunks
-// {49,50,51} and {52,53} — BPE can never produce one giant "12345" token.
-//
-// Newlines: text is split on '\n' first, and a single-byte chunk {10} is
-// inserted between lines so newlines act as hard boundaries too.
-// Tokenize splits text into byte-level chunks bounded by GPT4_SPLIT_PATTERN.
-// Special tokens are emitted as singleton chunks holding their reserved ID:
-// the regex matches them as standalone alternatives (they sit in front of the
-// pattern), and the per-chunk post-check below recognises the matched text
-// and substitutes the reserved ID instead of decomposing it to bytes.
-//
-// Because each special lives in its own length-1 chunk, `stats` can never
-// pair it with anything → BPE cannot merge across or into a special token.
+// Specials are emitted as singleton chunks holding their reserved ID, so
+// BPE can never merge into or across them. Digit runs cap at 3 ("12345"
+// -> {49,50,51}+{52,53}). Newlines are inserted as chunk {10}.
 func (bpe *BPETokenizer) Tokenize(text string) [][]int {
 	if text == "" {
 		fmt.Println("Tokenize: empty input, nothing to do")
@@ -219,16 +99,13 @@ func (bpe *BPETokenizer) Tokenize(text string) [][]int {
 	lines := strings.Split(text, "\n")
 	lineChunks := make([][][]int, len(lines))
 
-	workers := runtime.GOMAXPROCS(0)
-	if workers > len(lines) {
-		workers = len(lines)
-	}
+	workers := min(runtime.GOMAXPROCS(0), len(lines))
 
 	fmt.Printf("Tokenize: starting (%d lines, %d workers)\n", len(lines), workers)
 
 	jobs := make(chan int, workers*2)
 	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
+	for range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -260,81 +137,8 @@ func (bpe *BPETokenizer) Tokenize(text string) [][]int {
 	return all
 }
 
-func (bpe *BPETokenizer) tokenizeLine(lineText string, appendNewline bool) [][]int {
-	if lineText == "" {
-		if appendNewline {
-			return [][]int{{int('\n')}}
-		}
-		return nil
-	}
-
-	var chunks [][]int
-	start := 0
-	for start < len(lineText) {
-		match, err := bpe.splitRegex.FindStringMatch(lineText[start:])
-		if err != nil || match == nil {
-			break
-		}
-		matched := match.String()
-		// If the regex matched a special token, emit its reserved ID as a
-		// singleton chunk. Special IDs occupy [256, mergeStart); merge IDs
-		// (>= mergeStart) cannot end up here because learned merges are never
-		// added to the split regex.
-		if id, ok := bpe.vocab[matched]; ok && id >= 256 && id < bpe.mergeStart {
-			chunks = append(chunks, []int{id})
-		} else {
-			chunk := make([]int, 0, len(matched))
-			for i := 0; i < len(matched); i++ {
-				chunk = append(chunk, int(matched[i]))
-			}
-			chunks = append(chunks, chunk)
-		}
-		start += match.Index + len(matched)
-	}
-	if appendNewline {
-		chunks = append(chunks, []int{int('\n')})
-	}
-	return chunks
-}
-
-/**
- * Decode tokens into text
- * 1. Create a local copy of idToToken
- * 2. For each merge, update local copy with merged tokens
- * 3. For each token, convert to byte and append to result
-**/
-func (bpe *BPETokenizer) Decode(tokens []int) string {
-	if len(tokens) == 0 {
-		return ""
-	}
-
-	localVocab := make(map[int]string)
-	for id, tok := range bpe.idToToken {
-		localVocab[id] = tok
-	}
-
-	for _, merge := range bpe.Merges {
-		first := localVocab[merge.Pair.First]
-		second := localVocab[merge.Pair.Second]
-		localVocab[merge.Index] = first + second
-	}
-
-	var result []byte
-	for _, token := range tokens {
-		if tokenStr, exists := localVocab[token]; exists {
-			result = append(result, []byte(tokenStr)...)
-		}
-	}
-
-	return string(result)
-}
-
-// Encode text into tokens.
-//
-// Pre-split into chunks via Tokenize, apply every learned merge *inside* each
-// chunk, then concatenate the chunks into one flat []int. Merges never glue
-// bytes across chunk boundaries because each call to merge sees only one
-// chunk's slice.
+// Encode pre-splits via Tokenize, then replays merges within each chunk.
+// Example "cat" with merges {(c,a)->500, (500,t)->501} -> [501].
 func (bpe *BPETokenizer) Encode(text string) []int {
 	chunks := bpe.Tokenize(text)
 
@@ -353,50 +157,88 @@ func (bpe *BPETokenizer) Encode(text string) []int {
 	return out
 }
 
-func (bpe *BPETokenizer) Train(text string) {
+// Decode reconstructs text by replaying merges to materialise each ID's bytes.
+// Example: idToToken = {99:"c", 97:"a", 116:"t", 500:"ca", 501:"cat"} (501 came
+// from merge (500,116)) -> Decode([501]) == "cat".
+func (bpe *BPETokenizer) Decode(tokens []int) string {
+	if len(tokens) == 0 {
+		return ""
+	}
+
+	localVocab := make(map[int]string)
+	maps.Copy(localVocab, bpe.idToToken)
+
+	for _, merge := range bpe.Merges {
+		first := localVocab[merge.Pair.First]
+		second := localVocab[merge.Pair.Second]
+		localVocab[merge.Index] = first + second
+	}
+
+	var result []byte
+	for _, token := range tokens {
+		if tokenStr, exists := localVocab[token]; exists {
+			result = append(result, []byte(tokenStr)...)
+		}
+	}
+
+	return string(result)
+}
+
+// Train learns BPE merges from corpus r: each step picks the corpus-wide most
+// frequent pair, replaces it with a new token ID, and repeats until vocab is
+// full. Pair stats are maintained incrementally (see pairStats).
+func (bpe *BPETokenizer) Train(r io.Reader) {
 	fmt.Println("Starting Training")
-	chunks := bpe.Tokenize(text)
-	numOfMerges := VOCAB_SIZE - bpe.mergeStart
-	for i := 0; i < numOfMerges; i++ {
-		statsMap := bpe.stats(chunks)
-		if len(statsMap) == 0 {
-			for j := i; j < numOfMerges; j++ {
-				dummyPair := Pair{First: 0, Second: 0}
-				idx := bpe.mergeStart + j
-				bpe.Merges = append(bpe.Merges, Merge{dummyPair, idx})
-			}
+	words := bpe.countWordFrequencies(r)
+	fmt.Printf("Train: %d unique chunks after collapse\n", len(words))
+
+	stats := newPairStats(words)
+	numOfMerges := VocabSize - bpe.mergeStart
+
+	for i := range numOfMerges {
+		newID := bpe.mergeStart + i
+
+		bestPair, count, ok := stats.best()
+		if !ok {
+			fmt.Printf("Train: corpus exhausted after %d merges (target %d)\n", i, numOfMerges)
 			break
 		}
 
-		idx := bpe.mergeStart + i
-		maxUsedPair := bpe.mostFrequentPair(statsMap)
+		bpe.recordMerge(bestPair, newID, count, i+1, numOfMerges)
 
-		firstToken := bpe.idToToken[maxUsedPair.First]
-		secondToken := bpe.idToToken[maxUsedPair.Second]
-		mergedToken := firstToken + secondToken
-
-		bpe.vocab[mergedToken] = idx
-		bpe.idToToken[idx] = mergedToken
-
-		fmt.Printf("Merge %d/%d: (%d, %d) %q + %q -> %d %q (count=%d)\n",
-			i+1, numOfMerges,
-			maxUsedPair.First, maxUsedPair.Second,
-			firstToken, secondToken,
-			idx, mergedToken,
-			statsMap[maxUsedPair])
-
-		for j := range chunks {
-			chunks[j] = bpe.merge(chunks[j], maxUsedPair, idx)
+		// Rewrite every word that contains bestPair. Snapshot indices first
+		// because removeWord mutates stats.members[bestPair]. Subtract-then-add
+		// handles overlapping pairs like (a,a) in "aaaa" naturally.
+		for _, wi := range stats.wordsContaining(bestPair) {
+			stats.removeWord(wi, words[wi])
+			words[wi].Tokens = bpe.merge(words[wi].Tokens, bestPair, newID)
+			stats.addWord(wi, words[wi])
 		}
-		bpe.Merges = append(bpe.Merges, Merge{maxUsedPair, idx})
 	}
 	fmt.Println("Finished Training")
 }
 
+// recordMerge adds the merged token to the vocab and Merges list, and logs it.
+// Example: pair=(99,97) "c"+"a" -> newID=500 "ca".
+func (bpe *BPETokenizer) recordMerge(p Pair, newID, count, step, total int) {
+	first := bpe.idToToken[p.First]
+	second := bpe.idToToken[p.Second]
+	merged := first + second
+
+	bpe.vocab[merged] = newID
+	bpe.idToToken[newID] = merged
+	bpe.Merges = append(bpe.Merges, Merge{p, newID})
+
+	fmt.Printf("Merge %d/%d: (%d, %d) %q + %q -> %d %q (count=%d)\n",
+		step, total, p.First, p.Second, first, second, newID, merged, count)
+}
+
+// Save writes specials and learned merges to ./vocab.model.
+// Format: "S <token>" lines first, then "<first>-<second> <index>" per merge.
 func (bpe *BPETokenizer) Save() {
 	fileName := "vocab.model"
 
-	file, err := os.Create(fmt.Sprintf("./%s", fileName)) // creates or truncates
+	file, err := os.Create(fmt.Sprintf("./%s", fileName))
 	if err != nil {
 		fmt.Println("Error creating file:", err)
 		return
@@ -413,6 +255,8 @@ func (bpe *BPETokenizer) Save() {
 	fmt.Println("Vocab saved to", fileName)
 }
 
+// Load restores the tokenizer from ./vocab.model, replaying each merge to
+// rebuild idToToken (e.g. merge (99,97)->500 sets idToToken[500] = "ca").
 func (bpe *BPETokenizer) Load() {
 	fileName := "vocab.model"
 
@@ -423,7 +267,6 @@ func (bpe *BPETokenizer) Load() {
 	}
 	defer file.Close()
 
-	// Reset and reinitialize base vocabulary
 	bpe.vocab = make(map[string]int)
 	bpe.idToToken = make(map[int]string)
 	bpe.vocabSize = 256
@@ -432,8 +275,7 @@ func (bpe *BPETokenizer) Load() {
 	bpe.mergeStart = 256
 	bpe.splitRegex = buildSplitRegex(nil)
 
-	// Initialize base vocabulary with all 256 possible bytes
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		byteStr := string([]byte{byte(i)})
 		bpe.vocab[byteStr] = i
 		bpe.idToToken[i] = byteStr
@@ -470,4 +312,220 @@ func (bpe *BPETokenizer) Load() {
 			}
 		}
 	}
+}
+
+// --- internals ---
+
+// buildSplitRegex prepends specials as top-priority alternatives, longest
+// first so "<|endoftext|>" wins over "<|end|>" (Go regexp is leftmost-first).
+func buildSplitRegex(specialTokens []string) *regexp.Regexp {
+	if len(specialTokens) == 0 {
+		return regexp.MustCompile(GPT4SplitPattern)
+	}
+	sorted := append([]string{}, specialTokens...)
+	sort.SliceStable(sorted, func(i, j int) bool { return len(sorted[i]) > len(sorted[j]) })
+	alts := make([]string, 0, len(sorted))
+	for _, t := range sorted {
+		if t != "" {
+			alts = append(alts, regexp.QuoteMeta(t))
+		}
+	}
+	pattern := "(?:" + strings.Join(alts, "|") + ")|" + GPT4SplitPattern
+	return regexp.MustCompile(pattern)
+}
+
+func (bpe *BPETokenizer) tokenizeLine(lineText string, appendNewline bool) [][]int {
+	if lineText == "" {
+		if appendNewline {
+			return [][]int{{int('\n')}}
+		}
+		return nil
+	}
+
+	matches := bpe.splitRegex.FindAllStringIndex(lineText, -1)
+	chunks := make([][]int, 0, len(matches)+1)
+	for _, m := range matches {
+		matched := lineText[m[0]:m[1]]
+		// Special token matched -> emit singleton chunk with its reserved ID.
+		if id, ok := bpe.vocab[matched]; ok && id >= 256 && id < bpe.mergeStart {
+			chunks = append(chunks, []int{id})
+			continue
+		}
+		chunk := make([]int, len(matched))
+		for i := 0; i < len(matched); i++ {
+			chunk[i] = int(matched[i])
+		}
+		chunks = append(chunks, chunk)
+	}
+	if appendNewline {
+		chunks = append(chunks, []int{int('\n')})
+	}
+	return chunks
+}
+
+// merge replaces every adjacent (pair.First, pair.Second) with index, in place.
+// Example: merge([1,2,3,1,2], {1,2}, 99) -> [99,3,99].
+// Overlaps don't double-count: merge([1,1,1], {1,1}, 99) -> [99,1].
+func (bpe *BPETokenizer) merge(list []int, pair Pair, index int) []int {
+	w := 0
+	n := len(list)
+	for i := 0; i < n; i++ {
+		if i < n-1 && list[i] == pair.First && list[i+1] == pair.Second {
+			list[w] = index
+			w++
+			i++
+		} else {
+			list[w] = list[i]
+			w++
+		}
+	}
+	return list[:w]
+}
+
+// countWordFrequencies streams r line-by-line and returns each unique chunk
+// with how many times it occurred. Drops length-1 chunks (no pairs, also
+// filters specials). Memory is O(unique chunks), not O(corpus bytes).
+// Example corpus "cat cat hat" -> [{" cat",2}, {"cat",1}, {" hat",1}].
+func (bpe *BPETokenizer) countWordFrequencies(r io.Reader) []Word {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 1<<16), 64<<20)
+
+	workers := max(runtime.GOMAXPROCS(0), 1)
+
+	type local struct {
+		index map[string]int
+		words []Word
+	}
+	locals := make([]local, workers)
+	for i := range locals {
+		locals[i] = local{index: make(map[string]int, 1<<14)}
+	}
+
+	lineCh := make(chan string, workers*4)
+	var wg sync.WaitGroup
+	for w := range workers {
+		wg.Add(1)
+		go func(slot int) {
+			defer wg.Done()
+			keyBuf := make([]byte, 0, 32)
+			l := &locals[slot]
+			for line := range lineCh {
+				for _, c := range bpe.tokenizeLine(line, false) {
+					if len(c) < 2 {
+						continue
+					}
+					keyBuf = keyBuf[:0]
+					for _, id := range c {
+						keyBuf = append(keyBuf, byte(id>>24), byte(id>>16), byte(id>>8), byte(id))
+					}
+					key := string(keyBuf)
+					if idx, ok := l.index[key]; ok {
+						l.words[idx].Count++
+					} else {
+						l.index[key] = len(l.words)
+						l.words = append(l.words, Word{Tokens: c, Count: 1})
+					}
+				}
+			}
+		}(w)
+	}
+
+	for scanner.Scan() {
+		lineCh <- scanner.Text()
+	}
+	close(lineCh)
+	wg.Wait()
+	if err := scanner.Err(); err != nil {
+		panic(err)
+	}
+
+	idx0 := locals[0].index
+	words := locals[0].words
+	for i := 1; i < workers; i++ {
+		for key, j := range locals[i].index {
+			if dst, ok := idx0[key]; ok {
+				words[dst].Count += locals[i].words[j].Count
+			} else {
+				idx0[key] = len(words)
+				words = append(words, locals[i].words[j])
+			}
+		}
+	}
+	return words
+}
+
+// pairStats tracks adjacent-pair frequencies across the corpus and which
+// words each pair lives in, so Train can update both incrementally.
+//
+//	counts[(' ','t')]  = 1_000_000           // total weighted count
+//	members[(' ','t')] = {wi1, wi2, ...}     // words containing the pair
+type pairStats struct {
+	counts  map[Pair]int
+	members map[Pair]map[int]struct{}
+}
+
+func newPairStats(words []Word) *pairStats {
+	s := &pairStats{
+		counts:  make(map[Pair]int, len(words)),
+		members: make(map[Pair]map[int]struct{}, len(words)),
+	}
+	for wi := range words {
+		s.addWord(wi, words[wi])
+	}
+	return s
+}
+
+// addWord registers every adjacent pair in w as a contribution from word wi.
+func (s *pairStats) addWord(wi int, w Word) {
+	for j := 0; j < len(w.Tokens)-1; j++ {
+		p := Pair{w.Tokens[j], w.Tokens[j+1]}
+		s.counts[p] += w.Count
+		set, ok := s.members[p]
+		if !ok {
+			set = make(map[int]struct{})
+			s.members[p] = set
+		}
+		set[wi] = struct{}{}
+	}
+}
+
+// removeWord undoes addWord: subtracts w's pair contributions and drops the
+// word from each pair's member set. Empty entries are pruned.
+func (s *pairStats) removeWord(wi int, w Word) {
+	for j := 0; j < len(w.Tokens)-1; j++ {
+		p := Pair{w.Tokens[j], w.Tokens[j+1]}
+		s.counts[p] -= w.Count
+		if s.counts[p] <= 0 {
+			delete(s.counts, p)
+		}
+		if set, ok := s.members[p]; ok {
+			delete(set, wi)
+			if len(set) == 0 {
+				delete(s.members, p)
+			}
+		}
+	}
+}
+
+// best returns the most frequent pair, its count, and ok=false if empty.
+func (s *pairStats) best() (Pair, int, bool) {
+	var best Pair
+	max := 0
+	for p, c := range s.counts {
+		if c > max {
+			max = c
+			best = p
+		}
+	}
+	return best, max, max > 0
+}
+
+// wordsContaining returns a snapshot of the word indices that hold pair p.
+func (s *pairStats) wordsContaining(p Pair) []int {
+	set := s.members[p]
+	out := make([]int, 0, len(set))
+	for wi := range set {
+		out = append(out, wi)
+	}
+	return out
 }

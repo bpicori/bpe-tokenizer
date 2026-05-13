@@ -2,6 +2,7 @@ package bpe
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -147,85 +148,40 @@ func TestMerge(t *testing.T) {
 	}
 }
 
-func TestStats(t *testing.T) {
+func TestCountWordFrequencies(t *testing.T) {
 	tokenizer := NewBPETokenizer(nil)
 
-	tests := []struct {
-		name     string
-		chunks   [][]int
-		expected map[Pair]int
-	}{
-		{
-			name:   "simple sequence (one chunk)",
-			chunks: [][]int{{1, 2, 3, 4}},
-			expected: map[Pair]int{
-				{1, 2}: 1,
-				{2, 3}: 1,
-				{3, 4}: 1,
-			},
-		},
-		{
-			name:   "repeated pairs (one chunk)",
-			chunks: [][]int{{1, 2, 1, 2, 3}},
-			expected: map[Pair]int{
-				{1, 2}: 2,
-				{2, 1}: 1,
-				{2, 3}: 1,
-			},
-		},
-		{
-			name:     "single token",
-			chunks:   [][]int{{1}},
-			expected: map[Pair]int{},
-		},
-		{
-			name:     "empty chunks",
-			chunks:   [][]int{},
-			expected: map[Pair]int{},
-		},
-		{
-			name:   "two tokens (one chunk)",
-			chunks: [][]int{{1, 2}},
-			expected: map[Pair]int{
-				{1, 2}: 1,
-			},
-		},
-		{
-			name:   "boundary pair not counted across chunks",
-			chunks: [][]int{{1, 2}, {3, 4}},
-			expected: map[Pair]int{
-				{1, 2}: 1,
-				{3, 4}: 1,
-			},
-		},
-		{
-			name:   "same pair counted across multiple chunks",
-			chunks: [][]int{{1, 2, 3}, {9}, {1, 2, 5}},
-			expected: map[Pair]int{
-				{1, 2}: 2,
-				{2, 3}: 1,
-				{2, 5}: 1,
-			},
-		},
+	// "cat, cat, hat, cat" — the regex chunks the comma into its own length-1
+	// chunk, which countWordFrequencies drops. " cat" repeats twice, "cat"
+	// (leading the text, no preceding space) appears once, " hat" once.
+	text := "cat, cat, hat, cat"
+	words := tokenizer.countWordFrequencies(strings.NewReader(text))
+
+	got := map[string]int{}
+	for _, w := range words {
+		var sb strings.Builder
+		for _, id := range w.Tokens {
+			sb.WriteByte(byte(id))
+		}
+		got[sb.String()] = w.Count
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := tokenizer.stats(tt.chunks)
-			if !reflect.DeepEqual(result, tt.expected) {
-				t.Errorf("stats() = %v, want %v", result, tt.expected)
-			}
-		})
+	expected := map[string]int{
+		"cat":  1,
+		" cat": 2,
+		" hat": 1,
+	}
+	if !reflect.DeepEqual(got, expected) {
+		t.Errorf("countWordFrequencies words = %v, want %v", got, expected)
 	}
 }
 
-func TestMostFrequentPair(t *testing.T) {
-	tokenizer := NewBPETokenizer(nil)
-
+func TestPairStatsBest(t *testing.T) {
 	tests := []struct {
 		name     string
 		stats    map[Pair]int
 		expected Pair
+		wantOk   bool
 	}{
 		{
 			name: "single most frequent",
@@ -235,6 +191,7 @@ func TestMostFrequentPair(t *testing.T) {
 				{3, 4}: 2,
 			},
 			expected: Pair{1, 2},
+			wantOk:   true,
 		},
 		{
 			name: "tie - returns one of them",
@@ -242,12 +199,13 @@ func TestMostFrequentPair(t *testing.T) {
 				{1, 2}: 2,
 				{3, 4}: 2,
 			},
-			expected: Pair{}, // Will be one of the pairs, but we can't predict which
+			wantOk: true,
 		},
 		{
 			name:     "empty stats",
 			stats:    map[Pair]int{},
 			expected: Pair{},
+			wantOk:   false,
 		},
 		{
 			name: "single pair",
@@ -255,21 +213,23 @@ func TestMostFrequentPair(t *testing.T) {
 				{5, 6}: 1,
 			},
 			expected: Pair{5, 6},
+			wantOk:   true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := tokenizer.mostFrequentPair(tt.stats)
+			s := &pairStats{counts: tt.stats, members: map[Pair]map[int]struct{}{}}
+			result, _, ok := s.best()
+			if ok != tt.wantOk {
+				t.Errorf("best() ok = %v, want %v", ok, tt.wantOk)
+			}
 			if tt.name == "tie - returns one of them" {
-				// For ties, just check that the result is one of the valid pairs
 				if (result != Pair{1, 2}) && (result != Pair{3, 4}) {
-					t.Errorf("mostFrequentPair() = %v, want either {1, 2} or {3, 4}", result)
+					t.Errorf("best() = %v, want either {1, 2} or {3, 4}", result)
 				}
-			} else {
-				if result != tt.expected {
-					t.Errorf("mostFrequentPair() = %v, want %v", result, tt.expected)
-				}
+			} else if result != tt.expected {
+				t.Errorf("best() = %v, want %v", result, tt.expected)
 			}
 		})
 	}
@@ -494,13 +454,13 @@ func TestTrain(t *testing.T) {
 			name: "simple training",
 			text: "hello hello world world",
 			validate: func(t *testing.T, tokenizer *BPETokenizer) {
-				// After training, should have merges
-				expectedMerges := VOCAB_SIZE - 256
-				if len(tokenizer.Merges) != expectedMerges {
-					t.Errorf("Expected %d merges, got %d", expectedMerges, len(tokenizer.Merges))
+				if len(tokenizer.Merges) == 0 {
+					t.Error("Expected at least one merge")
+				}
+				if len(tokenizer.Merges) >= VocabSize-256 {
+					t.Errorf("Tiny corpus should exhaust before VOCAB_SIZE, got %d merges", len(tokenizer.Merges))
 				}
 
-				// Merges should have valid indices starting from 256
 				for i, merge := range tokenizer.Merges {
 					expectedIndex := 256 + i
 					if merge.Index != expectedIndex {
@@ -508,7 +468,6 @@ func TestTrain(t *testing.T) {
 					}
 				}
 
-				// Vocab should be populated
 				if len(tokenizer.vocab) == 0 {
 					t.Error("Expected vocab to be populated after training")
 				}
@@ -518,10 +477,8 @@ func TestTrain(t *testing.T) {
 			name: "empty text training",
 			text: "",
 			validate: func(t *testing.T, tokenizer *BPETokenizer) {
-				// Training on empty text should still create merges (though they might be empty)
-				expectedMerges := VOCAB_SIZE - 256
-				if len(tokenizer.Merges) != expectedMerges {
-					t.Errorf("Expected %d merges even for empty text, got %d", expectedMerges, len(tokenizer.Merges))
+				if len(tokenizer.Merges) != 0 {
+					t.Errorf("Empty corpus should produce 0 merges, got %d", len(tokenizer.Merges))
 				}
 			},
 		},
@@ -529,12 +486,10 @@ func TestTrain(t *testing.T) {
 			name: "single character training",
 			text: "a",
 			validate: func(t *testing.T, tokenizer *BPETokenizer) {
-				expectedMerges := VOCAB_SIZE - 256
-				if len(tokenizer.Merges) != expectedMerges {
-					t.Errorf("Expected %d merges, got %d", expectedMerges, len(tokenizer.Merges))
+				// A single byte has no adjacent pair to merge.
+				if len(tokenizer.Merges) != 0 {
+					t.Errorf("Single-byte corpus should produce 0 merges, got %d", len(tokenizer.Merges))
 				}
-
-				// Should have at least one token in vocab
 				if len(tokenizer.vocab) == 0 {
 					t.Error("Expected vocab to be populated")
 				}
@@ -545,7 +500,7 @@ func TestTrain(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tokenizer := NewBPETokenizer(nil)
-			tokenizer.Train(tt.text)
+			tokenizer.Train(strings.NewReader(tt.text))
 			tt.validate(t, tokenizer)
 		})
 	}
@@ -557,7 +512,7 @@ func TestIntegration(t *testing.T) {
 	text := "hello world hello world"
 
 	// Train the tokenizer
-	tokenizer.Train(text)
+	tokenizer.Train(strings.NewReader(text))
 
 	// Encode the text
 	encoded := tokenizer.Encode(text)
