@@ -23,9 +23,10 @@ make build
 ## Datasets
 
 ```bash
-make download-dataset       # Simple Wikipedia, ~few MB — quick sanity check
-make download-tinystories   # TinyStories, ~2 GB → data/TinyStoriesV2-GPT4-*.txt
-make download-openwebtext   # OpenWebText sample, ~12 GB raw → data/owt_*.txt
+make download-simple-wikipedia # Simple Wikipedia → data/simple-wikipedia.txt
+make download-wikitext2       # WikiText-2 v1 → data/wikitext2-{train,validation,test}.txt
+make download-tinystories     # TinyStories, ~2 GB → data/TinyStoriesV2-GPT4-*.txt
+make download-openwebtext    # OpenWebText sample, ~12 GB raw → data/owt_*.txt
 ```
 
 ## Special tokens

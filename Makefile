@@ -1,5 +1,5 @@
 
-.PHONY: build run test download-dataset download-tinystories download-openwebtext clean
+.PHONY: build run test download-simple-wikipedia download-wikitext2 download-tinystories download-openwebtext clean
 
 DATA_DIR := data
 
@@ -17,11 +17,20 @@ test:
 	go test ./...
 
 # Toy dataset (Simple Wikipedia) — small, good for quick sanity checks
-download-dataset:
+download-simple-wikipedia:
+	mkdir -p $(DATA_DIR)
 	python3 -m venv .venv
 	.venv/bin/pip install --quiet --upgrade pip
 	.venv/bin/pip install --quiet datasets
-	.venv/bin/python -c "from datasets import load_dataset; ds = load_dataset('rahular/simple-wikipedia'); f = open('training_text.txt', 'w'); f.write('\n'.join(ds['train']['text'])); f.close()"
+	.venv/bin/python -c "from datasets import load_dataset; ds = load_dataset('rahular/simple-wikipedia'); open('$(DATA_DIR)/simple-wikipedia.txt', 'w').write('\\n'.join(ds['train']['text']))"
+
+# WikiText-2 v1 — same corpus as https://huggingface.co/datasets/mindchain/wikitext2 (HF loads reliably via glue/wikitext).
+download-wikitext2:
+	mkdir -p $(DATA_DIR)
+	python3 -m venv .venv
+	.venv/bin/pip install --quiet --upgrade pip
+	.venv/bin/pip install --quiet datasets
+	.venv/bin/python -c "from pathlib import Path; from datasets import load_dataset; d = load_dataset('wikitext', 'wikitext-2-v1'); b = Path('$(DATA_DIR)'); [(b / ('wikitext2-%s.txt' % s)).write_text('\\n'.join(d[s]['text'])) for s in ('train', 'validation', 'test')]"
 
 # CS336 Assignment 1 — TinyStories (GPT-4 generated)
 # Source: https://huggingface.co/datasets/roneneldan/TinyStories
